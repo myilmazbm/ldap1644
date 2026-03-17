@@ -36,7 +36,8 @@
 static std::wstring GetExeDirectory()
 {
     WCHAR buf[MAX_PATH];
-    GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    DWORD len = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return L"."; // overflow protection
     PathRemoveFileSpecW(buf);
     return buf;
 }
@@ -182,24 +183,25 @@ static const wchar_t* CSV_HEADER =
 static std::wstring Event1644ToCsvLine(const Event1644& e)
 {
     std::wstring line;
-    line += CsvEscape(e.ldapServer)        + L",";
-    line += CsvEscape(e.timeGenerated)     + L",";
-    line += CsvEscape(e.clientIP)          + L",";
-    line += CsvEscape(e.clientPort)        + L",";
-    line += CsvEscape(e.startingNode)      + L",";
-    line += CsvEscape(e.filter)            + L",";
-    line += CsvEscape(e.searchScope)       + L",";
-    line += CsvEscape(e.attributeSelection)+ L",";
-    line += CsvEscape(e.serverControls)    + L",";
-    line += CsvEscape(e.visitedEntries)    + L",";
-    line += CsvEscape(e.returnedEntries)   + L",";
-    line += CsvEscape(e.usedIndexes)       + L",";
-    line += CsvEscape(e.pagesReferenced)   + L",";
-    line += CsvEscape(e.pagesReadFromDisk) + L",";
-    line += CsvEscape(e.pagesPreReadFromDisk)+ L",";
-    line += CsvEscape(e.cleanPagesModified)+ L",";
-    line += CsvEscape(e.dirtyPagesModified)+ L",";
-    line += CsvEscape(e.searchTimeMS)      + L",";
+    line.reserve(1024); // pre-allocate to avoid repeated reallocations
+    line += CsvEscape(e.ldapServer);         line += L',';
+    line += CsvEscape(e.timeGenerated);      line += L',';
+    line += CsvEscape(e.clientIP);           line += L',';
+    line += CsvEscape(e.clientPort);         line += L',';
+    line += CsvEscape(e.startingNode);       line += L',';
+    line += CsvEscape(e.filter);             line += L',';
+    line += CsvEscape(e.searchScope);        line += L',';
+    line += CsvEscape(e.attributeSelection); line += L',';
+    line += CsvEscape(e.serverControls);     line += L',';
+    line += CsvEscape(e.visitedEntries);     line += L',';
+    line += CsvEscape(e.returnedEntries);    line += L',';
+    line += CsvEscape(e.usedIndexes);        line += L',';
+    line += CsvEscape(e.pagesReferenced);    line += L',';
+    line += CsvEscape(e.pagesReadFromDisk);  line += L',';
+    line += CsvEscape(e.pagesPreReadFromDisk); line += L',';
+    line += CsvEscape(e.cleanPagesModified); line += L',';
+    line += CsvEscape(e.dirtyPagesModified); line += L',';
+    line += CsvEscape(e.searchTimeMS);       line += L',';
     line += CsvEscape(e.attrPreventingOpt);
     return line;
 }
@@ -311,6 +313,7 @@ static bool RenderEventData(EVT_HANDLE hEvent, std::vector<std::wstring>& values
 
         // Unescape basic XML entities
         std::wstring unescaped;
+        unescaped.reserve(val.size());
         for (size_t i = 0; i < val.size(); ++i)
         {
             if (val[i] == L'&')
@@ -320,6 +323,22 @@ static bool RenderEventData(EVT_HANDLE hEvent, std::vector<std::wstring>& values
                 else if (val.compare(i, 5, L"&amp;") == 0) { unescaped += L'&'; i += 4; }
                 else if (val.compare(i, 6, L"&apos;") == 0){ unescaped += L'\''; i += 5; }
                 else if (val.compare(i, 6, L"&quot;") == 0){ unescaped += L'"'; i += 5; }
+                else if (val.compare(i, 2, L"&#") == 0)
+                {   // Numeric character reference: &#123; or &#x1A;
+                    size_t semi = val.find(L';', i + 2);
+                    if (semi != std::wstring::npos && semi - i < 12)
+                    {
+                        std::wstring num = val.substr(i + 2, semi - i - 2);
+                        unsigned long cp = 0;
+                        if (!num.empty() && (num[0] == L'x' || num[0] == L'X'))
+                            cp = wcstoul(num.c_str() + 1, nullptr, 16);
+                        else
+                            cp = wcstoul(num.c_str(), nullptr, 10);
+                        if (cp > 0 && cp <= 0xFFFF) unescaped += static_cast<wchar_t>(cp);
+                        i = semi;
+                    }
+                    else unescaped += val[i];
+                }
                 else unescaped += val[i];
             }
             else
@@ -376,6 +395,11 @@ static int ProcessEvtxFile(const std::wstring& evtxPath, const std::wstring& csv
     FILE* csvFile = nullptr;
     int eventCount = 0;
 
+    // Reuse these across the loop to avoid per-event heap allocations
+    std::vector<std::wstring> props;
+    props.reserve(16);
+    Event1644 rec;
+
     EVT_HANDLE hEvents[100];
     DWORD dwReturned = 0;
 
@@ -390,7 +414,6 @@ static int ProcessEvtxFile(const std::wstring& evtxPath, const std::wstring& csv
             std::wstring timeCreated  = RenderSystemValue(hEvent, hCtxTime);
 
             // Get EventData properties
-            std::vector<std::wstring> props;
             if (!RenderEventData(hEvent, props))
             {
                 EvtClose(hEvent);
@@ -398,7 +421,6 @@ static int ProcessEvtxFile(const std::wstring& evtxPath, const std::wstring& csv
             }
 
             // Build Event1644 record (matching PS script property indices)
-            Event1644 rec;
             rec.ldapServer        = computerName;
             rec.timeGenerated     = timeCreated;
 
@@ -434,6 +456,8 @@ static int ProcessEvtxFile(const std::wstring& evtxPath, const std::wstring& csv
                     EvtClose(hEvent);
                     goto cleanup;
                 }
+                // Use 64KB write buffer for significantly faster file I/O
+                setvbuf(csvFile, nullptr, _IOFBF, 65536);
                 fwprintf(csvFile, L"%s\n", CSV_HEADER);
             }
 
@@ -525,16 +549,16 @@ static IDispatch* CallMethod(IDispatch* pDisp, LPCOLESTR name, int cArgs, ...)
         va_start(marker, cArgs);
 
         VARIANT* pArgs = new VARIANT[cArgs];
-        // Collect args (they'll be reversed in AutoWrap, so collect forward here
-        // and pass as reversed array)
-        VARIANT argsForward[16]; // max args we'll use
-        for (int i = 0; i < cArgs && i < 16; i++)
+        // Collect args forward then reverse for COM convention
+        VARIANT* argsForward = new VARIANT[cArgs];
+        for (int i = 0; i < cArgs; i++)
             argsForward[i] = va_arg(marker, VARIANT);
         va_end(marker);
 
         // Build reversed
         for (int i = 0; i < cArgs; i++)
             pArgs[i] = argsForward[cArgs - 1 - i];
+        delete[] argsForward;
 
         DISPPARAMS dp = { pArgs, nullptr, (UINT)cArgs, 0 };
         DISPID dispID;
@@ -682,6 +706,86 @@ static int GetUsedColCount(IDispatch* pSheet)
     return count;
 }
 
+// Return the Name property of a worksheet as a wstring.
+static std::wstring GetSheetName(IDispatch* pSheet)
+{
+    VARIANT v; VariantInit(&v);
+    AutoWrap(DISPATCH_PROPERTYGET, &v, pSheet, L"Name", 0);
+    std::wstring name;
+    if (v.vt == VT_BSTR && v.bstrVal) name = v.bstrVal;
+    VariantClear(&v);
+    return name;
+}
+
+// Create a single PivotCache from workbook + string source address.
+// Returns PivotCache IDispatch (caller owns), or nullptr on failure.
+static IDispatch* CreatePivotCache(IDispatch* pWb, const std::wstring& srcAddress)
+{
+    // PivotCaches is a METHOD on Workbook (PS: $wb.PivotCaches().Create(...))
+    VARIANT vPC; VariantInit(&vPC);
+    HRESULT hr = AutoWrap(DISPATCH_METHOD, &vPC, pWb, L"PivotCaches", 0);
+    if (FAILED(hr) || vPC.vt != VT_DISPATCH || !vPC.pdispVal)
+    {
+        wprintf(L"  [Pivot] Workbook.PivotCaches() failed hr=0x%08X vt=%d\n", hr, vPC.vt);
+        VariantClear(&vPC);
+        return nullptr;
+    }
+    IDispatch* pivotCaches = vPC.pdispVal;
+
+    VARIANT vType = MakeInt(1);                    // xlDatabase
+    VARIANT vSrc  = MakeBstr(srcAddress.c_str());
+    VARIANT vVer  = MakeInt(5);                    // xlPivotTableVersion15
+    VARIANT cr;  VariantInit(&cr);
+    hr = AutoWrap(DISPATCH_METHOD, &cr, pivotCaches, L"Create", 3, vType, vSrc, vVer);
+    SysFreeString(vSrc.bstrVal);
+    pivotCaches->Release();
+    if (FAILED(hr) || cr.vt != VT_DISPATCH || !cr.pdispVal)
+    {
+        wprintf(L"  [Pivot] PivotCaches.Create failed hr=0x%08X vt=%d\n", hr, cr.vt);
+        VariantClear(&cr);
+        return nullptr;
+    }
+
+    IDispatch* pCache = cr.pdispVal;
+    cr.vt = VT_EMPTY;  // take ownership without AddRef/Release dance
+    wprintf(L"  [Pivot] PivotCache created OK (%s)\n", srcAddress.c_str());
+    return pCache;
+}
+
+// Place a PivotTable on destSheet using an existing PivotCache.
+// Activates the sheet first (required for out-of-process COM).
+// Returns true on success.
+static bool PlacePivotOnSheet(IDispatch* pCache, IDispatch* pDestSheet,
+                              LPCOLESTR tableName)
+{
+    // Activate the target sheet before CreatePivotTable
+    CallMethod(pDestSheet, L"Activate", 0);
+
+    std::wstring sheetName = GetSheetName(pDestSheet);
+    if (sheetName.empty())
+    {
+        wprintf(L"  [Pivot] cannot get dest sheet name\n");
+        return false;
+    }
+
+    // Destination: SheetN!R1C1  (no quotes, matching PS script)
+    std::wstring destAddr = sheetName + L"!R1C1";
+
+    VARIANT vDest = MakeBstr(destAddr.c_str());
+    VARIANT ptResult; VariantInit(&ptResult);
+    HRESULT hr = AutoWrap(DISPATCH_METHOD, &ptResult, pCache, L"CreatePivotTable", 1, vDest);
+    SysFreeString(vDest.bstrVal);
+    VariantClear(&ptResult);
+    if (FAILED(hr))
+    {
+        wprintf(L"  [Pivot] CreatePivotTable(%s) failed hr=0x%08X\n", destAddr.c_str(), hr);
+        return false;
+    }
+
+    wprintf(L"  [Pivot] OK: %s on %s\n", tableName, sheetName.c_str());
+    return true;
+}
+
 // ============================================================================
 // Excel pivot-table setup (mirrors the PS script's sheets 2-8)
 // ============================================================================
@@ -694,7 +798,6 @@ static const int xlAverage   = -4106;
 static const int xlSum       = -4157;
 static const int xlCount     = -4112;
 static const int xlPercentOfTotal      = 8;
-static const int xlPercentRunningTotal = 13;
 static const LPCOLESTR mcNumberF  = L"###,###,###,###,###";
 static const LPCOLESTR mcPercentF = L"#0.00%";
 
@@ -713,21 +816,36 @@ static void SetPivotField(IDispatch* pField, int orientation, LPCOLESTR numFmt,
     if (position > 0)   PutPropInt(pField, L"Position", position);
 }
 
-// Get PivotField from sheet's pivot table
-static IDispatch* GetPivotField(IDispatch* pSheet, LPCOLESTR ptName, LPCOLESTR fieldName)
+// Get PivotTable object from sheet (caller must Release)
+static IDispatch* GetPivotTable(IDispatch* pSheet, LPCOLESTR ptName)
 {
     IDispatch* pivotTables = GetDispProp(pSheet, L"PivotTables");
     if (!pivotTables) return nullptr;
     IDispatch* pt = GetItemStr(pivotTables, ptName);
-    if (!pt) { pivotTables->Release(); return nullptr; }
+    pivotTables->Release();
+    return pt;
+}
+
+// Get PivotField directly from a cached PivotTable object (1 COM roundtrip)
+static IDispatch* GetPivotFieldFromPT(IDispatch* pt, LPCOLESTR fieldName)
+{
+    if (!pt) return nullptr;
     VARIANT result, vName;
     VariantInit(&result);
     vName = MakeBstr(fieldName);
     AutoWrap(DISPATCH_METHOD, &result, pt, L"PivotFields", 1, vName);
     SysFreeString(vName.bstrVal);
-    pt->Release();
-    pivotTables->Release();
     return (result.vt == VT_DISPATCH) ? result.pdispVal : nullptr;
+}
+
+// Legacy: Get PivotField from sheet (re-fetches PT each call — kept for compatibility)
+static IDispatch* GetPivotField(IDispatch* pSheet, LPCOLESTR ptName, LPCOLESTR fieldName)
+{
+    IDispatch* pt = GetPivotTable(pSheet, ptName);
+    if (!pt) return nullptr;
+    IDispatch* pf = GetPivotFieldFromPT(pt, fieldName);
+    pt->Release();
+    return pf;
 }
 
 // Format a pivot table sheet (freeze panes, column widths, name)
@@ -837,9 +955,31 @@ static void ImportCsvToExcel(const std::wstring& eventPath,
     IDispatch* pWb = CallMethod(pWorkbooks, L"Add", 0);
     if (!pWb) { pWorkbooks->Release(); pExcel->Release(); CoUninitialize(); return; }
 
+    // Disable screen updates and automatic calculation for massive speed boost.
+    // Without this, Excel redraws and recalculates after every single COM operation.
+    PutPropBool(pExcel, L"ScreenUpdating", false);
+    PutPropBool(pExcel, L"DisplayAlerts", false);
+    PutPropInt(pExcel, L"Calculation", -4135); // xlCalculationManual
+
     // Get Sheet1
     IDispatch* pSheets = GetDispProp(pWb, L"Worksheets");
+    if (!pSheets)
+    {
+        wprintf(L"  Error: cannot get Worksheets collection.\n");
+        PutPropBool(pExcel, L"ScreenUpdating", true);
+        PutPropBool(pExcel, L"DisplayAlerts", true);
+        pWb->Release(); pWorkbooks->Release(); pExcel->Release();
+        CoUninitialize(); return;
+    }
     IDispatch* pSheet1 = GetItem(pSheets, 1);
+    if (!pSheet1)
+    {
+        wprintf(L"  Error: cannot get Sheet1.\n");
+        PutPropBool(pExcel, L"ScreenUpdating", true);
+        PutPropBool(pExcel, L"DisplayAlerts", true);
+        pSheets->Release(); pWb->Release(); pWorkbooks->Release(); pExcel->Release();
+        CoUninitialize(); return;
+    }
 
     // Import each CSV via QueryTables
     int currentRow = 1;
@@ -869,6 +1009,9 @@ static void ImportCsvToExcel(const std::wstring& eventPath,
         {
             PutPropBool(pConnector, L"TextFileCommaDelimiter", true);
             PutPropInt(pConnector, L"TextFileParseType", 1);
+            // Disable background query so Refresh blocks until all data is imported.
+            // Without this, the sheet may still be empty when we read UsedRange later.
+            PutPropBool(pConnector, L"BackgroundQuery", false);
             CallMethod(pConnector, L"Refresh", 0);
             pConnector->Release();
         }
@@ -936,74 +1079,64 @@ static void ImportCsvToExcel(const std::wstring& eventPath,
         }
     }
 
-    int totalRows = GetUsedRowCount(pSheet1);
-    int totalCols = GetUsedColCount(pSheet1);
+    // Build source address string from the data sheet's ACTUAL name and row/col count.
+    // Using a string (matching the PS script) is required for COM IDispatch late-binding;
+    // passing a Range VT_DISPATCH object to PivotCaches.Create is not reliably accepted
+    // by Excel when called from an external out-of-process COM client.
+    const int    ds_rows = GetUsedRowCount(pSheet1);
+    const int    ds_cols = GetUsedColCount(pSheet1);
+    const std::wstring ds_name = GetSheetName(pSheet1);
+    wprintf(L"  Source sheet: '%s'  rows=%d  cols=%d\n", ds_name.c_str(), ds_rows, ds_cols);
+    if (ds_rows < 2)
+        wprintf(L"  Warning: data sheet appears empty; pivot tables will have no data.\n");
+    // No quotes around sheet name (matching PS script: "Sheet1!R1C1:R$rowsC$cols").
+    // At this point the sheet is still named 'Sheet1' (simple name, no special chars).
+    const std::wstring dataSource =
+        ds_name + L"!R1C1:R" +
+        std::to_wstring(ds_rows) + L"C" + std::to_wstring(ds_cols);
+    wprintf(L"  dataSource = %s\n", dataSource.c_str());
 
-    // Build data source reference
-    WCHAR dataSource[128];
-    _snwprintf_s(dataSource, _countof(dataSource), _TRUNCATE,
-                 L"Sheet1!R1C1:R%dC%d", totalRows, totalCols);
+    // Create a SINGLE PivotCache for all pivot tables (more efficient, avoids
+    // per-sheet cache creation issues with large datasets).
+    IDispatch* pPivotCache = CreatePivotCache(pWb, dataSource);
 
     // ---- Sheet2: PivotTable1 - StartingNode grouping ----
     {
         IDispatch* pSheet2 = CallMethod(pSheets, L"Add", 0);
-        if (pSheet2)
+        if (pSheet2 && pPivotCache)
         {
-            IDispatch* pivotCaches = GetDispProp(pWb, L"PivotCaches");
-            if (pivotCaches)
+            if (PlacePivotOnSheet(pPivotCache, pSheet2, L"PivotTable1"))
             {
-                VARIANT vSrc = MakeBstr(dataSource);
-                VARIANT vType = MakeInt(1); // xlDatabase
-                VARIANT vVer = MakeInt(5);  // xlPivotTableVersion15
-                IDispatch* pCache = nullptr;
-                VARIANT result;
-                VariantInit(&result);
-                AutoWrap(DISPATCH_METHOD, &result, pivotCaches, L"Create", 3, vType, vSrc, vVer);
-                SysFreeString(vSrc.bstrVal);
-                pCache = (result.vt == VT_DISPATCH) ? result.pdispVal : nullptr;
+                IDispatch* pt = GetPivotTable(pSheet2, L"PivotTable1");
+                IDispatch* pf;
+                pf = GetPivotFieldFromPT(pt, L"LDAPServer");
+                SetPivotField(pf, xlPageField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
 
-                if (pCache)
-                {
-                    VARIANT vDest = MakeBstr(L"Sheet2!R1C1");
-                    CallMethod(pCache, L"CreatePivotTable", 1, vDest);
-                    SysFreeString(vDest.bstrVal);
+                pf = GetPivotFieldFromPT(pt, L"StartingNode");
+                SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
 
-                    // Configure fields
-                    IDispatch* pf;
-                    pf = GetPivotField(pSheet2, L"PivotTable1", L"LDAPServer");
-                    SetPivotField(pf, xlPageField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"Filter");
+                SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
 
-                    pf = GetPivotField(pSheet2, L"PivotTable1", L"StartingNode");
-                    SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"ClientIP");
+                SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
 
-                    pf = GetPivotField(pSheet2, L"PivotTable1", L"Filter");
-                    SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"TimeGenerated");
+                SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
 
-                    pf = GetPivotField(pSheet2, L"PivotTable1", L"ClientIP");
-                    SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"ClientIP");
+                SetPivotField(pf, xlDataField, mcNumberF, 0, 0, nullptr, L"Search Count", 1); if(pf) pf->Release();
 
-                    pf = GetPivotField(pSheet2, L"PivotTable1", L"TimeGenerated");
-                    SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"SearchTimeMS");
+                SetPivotField(pf, xlDataField, mcNumberF, xlAverage, 0, nullptr, L"AvgSearchTime", 2); if(pf) pf->Release();
 
-                    pf = GetPivotField(pSheet2, L"PivotTable1", L"ClientIP");
-                    SetPivotField(pf, xlDataField, mcNumberF, 0, 0, nullptr, L"Search Count", 1); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"ClientIP");
+                SetPivotField(pf, xlDataField, mcPercentF, 0, xlPercentOfTotal, nullptr, L"%GrandTotal", 3); if(pf) pf->Release();
+                if (pt) pt->Release();
 
-                    pf = GetPivotField(pSheet2, L"PivotTable1", L"SearchTimeMS");
-                    SetPivotField(pf, xlDataField, mcNumberF, xlAverage, 0, nullptr, L"AvgSearchTime", 2); if(pf) pf->Release();
-
-                    pf = GetPivotField(pSheet2, L"PivotTable1", L"ClientIP");
-                    SetPivotField(pf, xlDataField, mcPercentF, 0, xlPercentOfTotal, nullptr, L"%GrandTotal", 3); if(pf) pf->Release();
-
-                    pf = GetPivotField(pSheet2, L"PivotTable1", L"ClientIP");
-                    SetPivotField(pf, xlDataField, mcPercentF, 0, xlPercentRunningTotal, L"StartingNode", L"%RunningTotal", 4); if(pf) pf->Release();
-
-                    int widths[] = { 60, 12, 14, 12, 14, 0, 0 };
-                    FormatPivotSheet(pSheet2, L"PivotTable1", widths, 7,
-                                     L"StartingNode grouping", L"2.TopIP-StartingNode");
-
-                    pCache->Release();
-                }
-                pivotCaches->Release();
+                int widths[] = { 60, 12, 14, 12, 14, 0, 0 };
+                FormatPivotSheet(pSheet2, L"PivotTable1", widths, 7,
+                                 L"StartingNode grouping", L"2.TopIP-StartingNode");
             }
             pSheet2->Release();
         }
@@ -1012,48 +1145,32 @@ static void ImportCsvToExcel(const std::wstring& eventPath,
     // ---- Sheet3: PivotTable2 - IP grouping ----
     {
         IDispatch* pSheet3 = CallMethod(pSheets, L"Add", 0);
-        if (pSheet3)
+        if (pSheet3 && pPivotCache)
         {
-            IDispatch* pivotCaches = GetDispProp(pWb, L"PivotCaches");
-            if (pivotCaches)
+            if (PlacePivotOnSheet(pPivotCache, pSheet3, L"PivotTable2"))
             {
-                VARIANT vSrc = MakeBstr(dataSource);
-                VARIANT vType = MakeInt(1), vVer = MakeInt(5);
-                VARIANT result; VariantInit(&result);
-                AutoWrap(DISPATCH_METHOD, &result, pivotCaches, L"Create", 3, vType, vSrc, vVer);
-                SysFreeString(vSrc.bstrVal);
-                IDispatch* pCache = (result.vt == VT_DISPATCH) ? result.pdispVal : nullptr;
-                if (pCache)
-                {
-                    VARIANT vDest = MakeBstr(L"Sheet3!R1C1");
-                    CallMethod(pCache, L"CreatePivotTable", 1, vDest);
-                    SysFreeString(vDest.bstrVal);
+                IDispatch* pt = GetPivotTable(pSheet3, L"PivotTable2");
+                IDispatch* pf;
+                pf = GetPivotFieldFromPT(pt, L"LDAPServer");
+                SetPivotField(pf, xlPageField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"ClientIP");
+                SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"Filter");
+                SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"TimeGenerated");
+                SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
 
-                    IDispatch* pf;
-                    pf = GetPivotField(pSheet3, L"PivotTable2", L"LDAPServer");
-                    SetPivotField(pf, xlPageField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet3, L"PivotTable2", L"ClientIP");
-                    SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet3, L"PivotTable2", L"Filter");
-                    SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet3, L"PivotTable2", L"TimeGenerated");
-                    SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"ClientIP");
+                SetPivotField(pf, xlDataField, mcNumberF, 0, 0, nullptr, L"Search Count", 1); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"SearchTimeMS");
+                SetPivotField(pf, xlDataField, mcNumberF, xlAverage, 0, nullptr, L"AvgSearchTime (MS)", 2); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"ClientIP");
+                SetPivotField(pf, xlDataField, mcPercentF, 0, xlPercentOfTotal, nullptr, L"%GrandTotal", 3); if(pf) pf->Release();
+                if (pt) pt->Release();
 
-                    pf = GetPivotField(pSheet3, L"PivotTable2", L"ClientIP");
-                    SetPivotField(pf, xlDataField, mcNumberF, 0, 0, nullptr, L"Search Count", 1); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet3, L"PivotTable2", L"SearchTimeMS");
-                    SetPivotField(pf, xlDataField, mcNumberF, xlAverage, 0, nullptr, L"AvgSearchTime (MS)", 2); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet3, L"PivotTable2", L"ClientIP");
-                    SetPivotField(pf, xlDataField, mcPercentF, 0, xlPercentOfTotal, nullptr, L"%GrandTotal", 3); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet3, L"PivotTable2", L"ClientIP");
-                    SetPivotField(pf, xlDataField, mcPercentF, 0, xlPercentRunningTotal, L"ClientIP", L"%RunningTotal", 4); if(pf) pf->Release();
-
-                    int widths[] = { 60, 12, 19, 12, 14, 0, 0 };
-                    FormatPivotSheet(pSheet3, L"PivotTable2", widths, 7,
-                                     L"IP grouping", L"3.TopIP");
-                    pCache->Release();
-                }
-                pivotCaches->Release();
+                int widths[] = { 60, 12, 19, 12, 14, 0, 0 };
+                FormatPivotSheet(pSheet3, L"PivotTable2", widths, 7,
+                                 L"IP grouping", L"3.TopIP");
             }
             pSheet3->Release();
         }
@@ -1062,48 +1179,32 @@ static void ImportCsvToExcel(const std::wstring& eventPath,
     // ---- Sheet4: PivotTable3 - Filter grouping ----
     {
         IDispatch* pSheet4 = CallMethod(pSheets, L"Add", 0);
-        if (pSheet4)
+        if (pSheet4 && pPivotCache)
         {
-            IDispatch* pivotCaches = GetDispProp(pWb, L"PivotCaches");
-            if (pivotCaches)
+            if (PlacePivotOnSheet(pPivotCache, pSheet4, L"PivotTable3"))
             {
-                VARIANT vSrc = MakeBstr(dataSource);
-                VARIANT vType = MakeInt(1), vVer = MakeInt(5);
-                VARIANT result; VariantInit(&result);
-                AutoWrap(DISPATCH_METHOD, &result, pivotCaches, L"Create", 3, vType, vSrc, vVer);
-                SysFreeString(vSrc.bstrVal);
-                IDispatch* pCache = (result.vt == VT_DISPATCH) ? result.pdispVal : nullptr;
-                if (pCache)
-                {
-                    VARIANT vDest = MakeBstr(L"Sheet4!R1C1");
-                    CallMethod(pCache, L"CreatePivotTable", 1, vDest);
-                    SysFreeString(vDest.bstrVal);
+                IDispatch* pt = GetPivotTable(pSheet4, L"PivotTable3");
+                IDispatch* pf;
+                pf = GetPivotFieldFromPT(pt, L"LDAPServer");
+                SetPivotField(pf, xlPageField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"Filter");
+                SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"ClientIP");
+                SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"TimeGenerated");
+                SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
 
-                    IDispatch* pf;
-                    pf = GetPivotField(pSheet4, L"PivotTable3", L"LDAPServer");
-                    SetPivotField(pf, xlPageField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet4, L"PivotTable3", L"Filter");
-                    SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet4, L"PivotTable3", L"ClientIP");
-                    SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet4, L"PivotTable3", L"TimeGenerated");
-                    SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"ClientIP");
+                SetPivotField(pf, xlDataField, mcNumberF, 0, 0, nullptr, L"Search Count", 1); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"SearchTimeMS");
+                SetPivotField(pf, xlDataField, mcNumberF, xlAverage, 0, nullptr, L"AvgSearchTime (MS)", 2); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"ClientIP");
+                SetPivotField(pf, xlDataField, mcPercentF, 0, xlPercentOfTotal, nullptr, L"%GrandTotal", 3); if(pf) pf->Release();
+                if (pt) pt->Release();
 
-                    pf = GetPivotField(pSheet4, L"PivotTable3", L"ClientIP");
-                    SetPivotField(pf, xlDataField, mcNumberF, 0, 0, nullptr, L"Search Count", 1); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet4, L"PivotTable3", L"SearchTimeMS");
-                    SetPivotField(pf, xlDataField, mcNumberF, xlAverage, 0, nullptr, L"AvgSearchTime (MS)", 2); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet4, L"PivotTable3", L"ClientIP");
-                    SetPivotField(pf, xlDataField, mcPercentF, 0, xlPercentOfTotal, nullptr, L"%GrandTotal", 3); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet4, L"PivotTable3", L"ClientIP");
-                    SetPivotField(pf, xlDataField, mcPercentF, 0, xlPercentRunningTotal, L"Filter", L"%RunningTotal", 4); if(pf) pf->Release();
-
-                    int widths[] = { 60, 12, 19, 12, 14, 0, 0 };
-                    FormatPivotSheet(pSheet4, L"PivotTable3", widths, 7,
-                                     L"Filter grouping", L"4.TopIP-Filters");
-                    pCache->Release();
-                }
-                pivotCaches->Release();
+                int widths[] = { 60, 12, 19, 12, 14, 0, 0 };
+                FormatPivotSheet(pSheet4, L"PivotTable3", widths, 7,
+                                 L"Filter grouping", L"4.TopIP-Filters");
             }
             pSheet4->Release();
         }
@@ -1112,50 +1213,34 @@ static void ImportCsvToExcel(const std::wstring& eventPath,
     // ---- Sheet5: PivotTable4 - TopTime by IP ----
     {
         IDispatch* pSheet5 = CallMethod(pSheets, L"Add", 0);
-        if (pSheet5)
+        if (pSheet5 && pPivotCache)
         {
-            IDispatch* pivotCaches = GetDispProp(pWb, L"PivotCaches");
-            if (pivotCaches)
+            if (PlacePivotOnSheet(pPivotCache, pSheet5, L"PivotTable4"))
             {
-                VARIANT vSrc = MakeBstr(dataSource);
-                VARIANT vType = MakeInt(1), vVer = MakeInt(5);
-                VARIANT result; VariantInit(&result);
-                AutoWrap(DISPATCH_METHOD, &result, pivotCaches, L"Create", 3, vType, vSrc, vVer);
-                SysFreeString(vSrc.bstrVal);
-                IDispatch* pCache = (result.vt == VT_DISPATCH) ? result.pdispVal : nullptr;
-                if (pCache)
-                {
-                    VARIANT vDest = MakeBstr(L"Sheet5!R1C1");
-                    CallMethod(pCache, L"CreatePivotTable", 1, vDest);
-                    SysFreeString(vDest.bstrVal);
+                IDispatch* pt = GetPivotTable(pSheet5, L"PivotTable4");
+                IDispatch* pf;
+                pf = GetPivotFieldFromPT(pt, L"LDAPServer");
+                SetPivotField(pf, xlPageField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"ClientIP");
+                SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"Filter");
+                SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"TimeGenerated");
+                SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
 
-                    IDispatch* pf;
-                    pf = GetPivotField(pSheet5, L"PivotTable4", L"LDAPServer");
-                    SetPivotField(pf, xlPageField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet5, L"PivotTable4", L"ClientIP");
-                    SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet5, L"PivotTable4", L"Filter");
-                    SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet5, L"PivotTable4", L"TimeGenerated");
-                    SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"SearchTimeMS");
+                SetPivotField(pf, xlDataField, mcNumberF, xlSum, 0, nullptr, L"Total SearchTime (MS)"); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"ClientIP");
+                SetPivotField(pf, xlDataField, mcNumberF, 0, 0, nullptr, L"Search Count"); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"SearchTimeMS");
+                SetPivotField(pf, xlDataField, mcNumberF, xlAverage, 0, nullptr, L"AvgSearchTime (MS)"); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"SearchTimeMS");
+                SetPivotField(pf, xlDataField, mcPercentF, 0, xlPercentOfTotal, nullptr, L"%GrandTotal (MS)"); if(pf) pf->Release();
+                if (pt) pt->Release();
 
-                    pf = GetPivotField(pSheet5, L"PivotTable4", L"SearchTimeMS");
-                    SetPivotField(pf, xlDataField, mcNumberF, xlSum, 0, nullptr, L"Total SearchTime (MS)"); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet5, L"PivotTable4", L"ClientIP");
-                    SetPivotField(pf, xlDataField, mcNumberF, 0, 0, nullptr, L"Search Count"); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet5, L"PivotTable4", L"SearchTimeMS");
-                    SetPivotField(pf, xlDataField, mcNumberF, xlAverage, 0, nullptr, L"AvgSearchTime (MS)"); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet5, L"PivotTable4", L"SearchTimeMS");
-                    SetPivotField(pf, xlDataField, mcPercentF, 0, xlPercentOfTotal, nullptr, L"%GrandTotal (MS)"); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet5, L"PivotTable4", L"SearchTimeMS");
-                    SetPivotField(pf, xlDataField, mcPercentF, 0, xlPercentRunningTotal, L"ClientIP", L"%RunningTotal (Ms)"); if(pf) pf->Release();
-
-                    int widths[] = { 50, 21, 12, 19, 17, 19, 0 };
-                    FormatPivotSheet(pSheet5, L"PivotTable4", widths, 7,
-                                     L"IP grouping", L"5.TopTime-IP");
-                    pCache->Release();
-                }
-                pivotCaches->Release();
+                int widths[] = { 50, 21, 12, 19, 17, 19, 0 };
+                FormatPivotSheet(pSheet5, L"PivotTable4", widths, 7,
+                                 L"IP grouping", L"5.TopTime-IP");
             }
             pSheet5->Release();
         }
@@ -1164,50 +1249,34 @@ static void ImportCsvToExcel(const std::wstring& eventPath,
     // ---- Sheet6: PivotTable5 - TopTime by Filters ----
     {
         IDispatch* pSheet6 = CallMethod(pSheets, L"Add", 0);
-        if (pSheet6)
+        if (pSheet6 && pPivotCache)
         {
-            IDispatch* pivotCaches = GetDispProp(pWb, L"PivotCaches");
-            if (pivotCaches)
+            if (PlacePivotOnSheet(pPivotCache, pSheet6, L"PivotTable5"))
             {
-                VARIANT vSrc = MakeBstr(dataSource);
-                VARIANT vType = MakeInt(1), vVer = MakeInt(5);
-                VARIANT result; VariantInit(&result);
-                AutoWrap(DISPATCH_METHOD, &result, pivotCaches, L"Create", 3, vType, vSrc, vVer);
-                SysFreeString(vSrc.bstrVal);
-                IDispatch* pCache = (result.vt == VT_DISPATCH) ? result.pdispVal : nullptr;
-                if (pCache)
-                {
-                    VARIANT vDest = MakeBstr(L"Sheet6!R1C1");
-                    CallMethod(pCache, L"CreatePivotTable", 1, vDest);
-                    SysFreeString(vDest.bstrVal);
+                IDispatch* pt = GetPivotTable(pSheet6, L"PivotTable5");
+                IDispatch* pf;
+                pf = GetPivotFieldFromPT(pt, L"LDAPServer");
+                SetPivotField(pf, xlPageField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"Filter");
+                SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"ClientIP");
+                SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"TimeGenerated");
+                SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
 
-                    IDispatch* pf;
-                    pf = GetPivotField(pSheet6, L"PivotTable5", L"LDAPServer");
-                    SetPivotField(pf, xlPageField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet6, L"PivotTable5", L"Filter");
-                    SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet6, L"PivotTable5", L"ClientIP");
-                    SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet6, L"PivotTable5", L"TimeGenerated");
-                    SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"SearchTimeMS");
+                SetPivotField(pf, xlDataField, mcNumberF, xlSum, 0, nullptr, L"Total SearchTime (MS)"); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"ClientIP");
+                SetPivotField(pf, xlDataField, mcNumberF, 0, 0, nullptr, L"Search Count"); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"SearchTimeMS");
+                SetPivotField(pf, xlDataField, mcNumberF, xlAverage, 0, nullptr, L"AvgSearchTime (MS)"); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"SearchTimeMS");
+                SetPivotField(pf, xlDataField, mcPercentF, 0, xlPercentOfTotal, nullptr, L"%GrandTotal (MS)"); if(pf) pf->Release();
+                if (pt) pt->Release();
 
-                    pf = GetPivotField(pSheet6, L"PivotTable5", L"SearchTimeMS");
-                    SetPivotField(pf, xlDataField, mcNumberF, xlSum, 0, nullptr, L"Total SearchTime (MS)"); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet6, L"PivotTable5", L"ClientIP");
-                    SetPivotField(pf, xlDataField, mcNumberF, 0, 0, nullptr, L"Search Count"); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet6, L"PivotTable5", L"SearchTimeMS");
-                    SetPivotField(pf, xlDataField, mcNumberF, xlAverage, 0, nullptr, L"AvgSearchTime (MS)"); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet6, L"PivotTable5", L"SearchTimeMS");
-                    SetPivotField(pf, xlDataField, mcPercentF, 0, xlPercentOfTotal, nullptr, L"%GrandTotal (MS)"); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet6, L"PivotTable5", L"SearchTimeMS");
-                    SetPivotField(pf, xlDataField, mcPercentF, 0, xlPercentRunningTotal, L"Filter", L"%RunningTotal (MS)"); if(pf) pf->Release();
-
-                    int widths[] = { 50, 21, 12, 19, 17, 19, 0 };
-                    FormatPivotSheet(pSheet6, L"PivotTable5", widths, 7,
-                                     L"Filter grouping", L"6.TopTime-Filters");
-                    pCache->Release();
-                }
-                pivotCaches->Release();
+                int widths[] = { 50, 21, 12, 19, 17, 19, 0 };
+                FormatPivotSheet(pSheet6, L"PivotTable5", widths, 7,
+                                 L"Filter grouping", L"6.TopTime-Filters");
             }
             pSheet6->Release();
         }
@@ -1216,52 +1285,39 @@ static void ImportCsvToExcel(const std::wstring& eventPath,
     // ---- Sheet7: PivotTable6 - TimeRanks ----
     {
         IDispatch* pSheet7 = CallMethod(pSheets, L"Add", 0);
-        if (pSheet7)
+        if (pSheet7 && pPivotCache)
         {
-            IDispatch* pivotCaches = GetDispProp(pWb, L"PivotCaches");
-            if (pivotCaches)
+            if (PlacePivotOnSheet(pPivotCache, pSheet7, L"PivotTable6"))
             {
-                VARIANT vSrc = MakeBstr(dataSource);
-                VARIANT vType = MakeInt(1), vVer = MakeInt(5);
-                VARIANT result; VariantInit(&result);
-                AutoWrap(DISPATCH_METHOD, &result, pivotCaches, L"Create", 3, vType, vSrc, vVer);
-                SysFreeString(vSrc.bstrVal);
-                IDispatch* pCache = (result.vt == VT_DISPATCH) ? result.pdispVal : nullptr;
-                if (pCache)
-                {
-                    VARIANT vDest = MakeBstr(L"Sheet7!R1C1");
-                    CallMethod(pCache, L"CreatePivotTable", 1, vDest);
-                    SysFreeString(vDest.bstrVal);
+                IDispatch* pt = GetPivotTable(pSheet7, L"PivotTable6");
+                IDispatch* pf;
+                pf = GetPivotFieldFromPT(pt, L"LDAPServer");
+                SetPivotField(pf, xlPageField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"SearchTimeMS");
+                SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"Filter");
+                SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"ClientIP");
+                SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"TimeGenerated");
+                SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
 
-                    IDispatch* pf;
-                    pf = GetPivotField(pSheet7, L"PivotTable6", L"LDAPServer");
-                    SetPivotField(pf, xlPageField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet7, L"PivotTable6", L"SearchTimeMS");
-                    SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet7, L"PivotTable6", L"Filter");
-                    SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet7, L"PivotTable6", L"ClientIP");
-                    SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet7, L"PivotTable6", L"TimeGenerated");
-                    SetPivotField(pf, xlRowField, nullptr, 0, 0, nullptr, nullptr); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"ClientIP");
+                SetPivotField(pf, xlDataField, mcNumberF, 0, 0, nullptr, L"Search Count"); if(pf) pf->Release();
+                pf = GetPivotFieldFromPT(pt, L"SearchTimeMS");
+                SetPivotField(pf, xlDataField, mcPercentF, xlSum, xlPercentOfTotal, nullptr, L"%GrandTotal (MS)"); if(pf) pf->Release();
+                if (pt) pt->Release();
 
-                    pf = GetPivotField(pSheet7, L"PivotTable6", L"ClientIP");
-                    SetPivotField(pf, xlDataField, mcNumberF, 0, 0, nullptr, L"Search Count"); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet7, L"PivotTable6", L"SearchTimeMS");
-                    SetPivotField(pf, xlDataField, mcPercentF, xlSum, xlPercentOfTotal, nullptr, L"%GrandTotal (MS)"); if(pf) pf->Release();
-                    pf = GetPivotField(pSheet7, L"PivotTable6", L"SearchTimeMS");
-                    SetPivotField(pf, xlDataField, mcPercentF, xlSum, xlPercentRunningTotal, L"SearchTimeMS", L"%RunningTotal (MS)"); if(pf) pf->Release();
-
-                    int widths[] = { 60, 12, 17, 19, 0, 0, 0 };
-                    FormatPivotSheet(pSheet7, L"PivotTable6", widths, 7,
-                                     L"SearchTime (MS) grouping", L"7.TimeRanks");
-                    pCache->Release();
-                }
-                pivotCaches->Release();
+                int widths[] = { 60, 12, 17, 19, 0, 0, 0 };
+                FormatPivotSheet(pSheet7, L"PivotTable6", widths, 7,
+                                 L"SearchTime (MS) grouping", L"7.TimeRanks");
             }
             pSheet7->Release();
         }
     }
+
+    // Release the shared PivotCache now that all tables are created
+    if (pPivotCache) { pPivotCache->Release(); pPivotCache = nullptr; }
 
     // ---- Sheet8: Sandbox ----
     {
@@ -1286,19 +1342,15 @@ static void ImportCsvToExcel(const std::wstring& eventPath,
         IDispatch* tab = GetDispProp(pSh, L"Tab");
         if (tab)
         {
-            VARIANT vName;
-            VariantInit(&vName);
-            AutoWrap(DISPATCH_PROPERTYGET, &vName, pSh, L"Name", 0);
-            if (vName.vt == VT_BSTR)
+            std::wstring nm = GetSheetName(pSh);
+            if (!nm.empty())
             {
-                std::wstring nm = vName.bstrVal;
                 if (nm[0] == L'2' || nm[0] == L'3' || nm[0] == L'4')
                     PutPropInt(tab, L"ColorIndex", 35);
                 else if (nm[0] == L'5' || nm[0] == L'6' || nm[0] == L'7')
                     PutPropInt(tab, L"ColorIndex", 36);
                 else if (nm[0] == L'8')
                     PutPropInt(tab, L"Color", 8109667);
-                SysFreeString(vName.bstrVal);
             }
             tab->Release();
         }
@@ -1357,6 +1409,18 @@ static void ImportCsvToExcel(const std::wstring& eventPath,
     std::wstring fileName = ReadLine(L"Enter a FileName to save extracted event 1644 xlsx:\n");
     if (!fileName.empty())
     {
+        // Sanitize: strip path separators to prevent path traversal
+        for (auto& ch : fileName)
+        {
+            if (ch == L'\\' || ch == L'/' || ch == L':') ch = L'_';
+        }
+        // Strip leading dots to prevent hidden files or ../ escape
+        size_t start = fileName.find_first_not_of(L'.');
+        if (start != std::wstring::npos && start > 0)
+            fileName = fileName.substr(start);
+        else if (start == std::wstring::npos)
+            fileName = L"Event1644Report";
+
         std::wstring fullPath = eventPath + L"\\" + fileName;
         wprintf(L"Saving file to %s.xlsx\n", fullPath.c_str());
         VARIANT vPath = MakeBstr(fullPath.c_str());
@@ -1375,6 +1439,11 @@ static void ImportCsvToExcel(const std::wstring& eventPath,
                 wprintf(L"\t%s deleted.\n", csv.c_str());
         }
     }
+
+    // Restore Excel settings before making visible
+    PutPropInt(pExcel, L"Calculation", -4105); // xlCalculationAutomatic
+    PutPropBool(pExcel, L"ScreenUpdating", true);
+    PutPropBool(pExcel, L"DisplayAlerts", true);
 
     // Make Excel visible
     PutPropBool(pExcel, L"Visible", true);
@@ -1408,6 +1477,14 @@ int wmain(int /*argc*/, wchar_t* /*argv*/[])
     {
         eventPath = scriptPath;
         wprintf(L"\tScanning event logs in %s\n", eventPath.c_str());
+    }
+
+    // Validate that the path exists and is a directory
+    DWORD pathAttr = GetFileAttributesW(eventPath.c_str());
+    if (pathAttr == INVALID_FILE_ATTRIBUTES || !(pathAttr & FILE_ATTRIBUTE_DIRECTORY))
+    {
+        wprintf(L"  Error: '%s' is not a valid directory.\n", eventPath.c_str());
+        return 1;
     }
 
     // Scan for .evtx files
